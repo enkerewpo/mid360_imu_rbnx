@@ -138,17 +138,34 @@ class _ImuDriverServicer(contracts_grpc.PrimitiveImuDriverServicer):
                 return lifecycle_pb2.Driver_Response(ok=True, state="ready", error="")
 
         imu_topic = cfg.get("imu_topic", "/livox/imu")
-        # Short probe — we're a topic shim with NO underlying ROS process
-        # to spawn, so if the topic isn't there yet it's because our peer
-        # (mid360_lidar_rbnx) hasn't completed Init. Return `deferred`
-        # fast and let rbnx boot retry us once it has — far cheaper than
-        # holding the full sentinel_timeout for a known-async wait.
+        # Two-phase wait. We're a topic shim with NO underlying ROS
+        # process to spawn — the topic comes from our peer
+        # (mid360_lidar_rbnx)'s livox launch.
+        #
+        # Phase 1: short probe. If the topic shows up fast, great.
+        # Phase 2: if not there yet, it's likely our peer's Init is
+        #   still running. Two compatible behaviours:
+        #     (a) when rbnx-cli supports a defer queue (TODO), we'd
+        #         return state="deferred" and let it retry us once
+        #         our peer completes;
+        #     (b) until then, fall back to the full sentinel timeout
+        #         so we keep working under sequential boot order
+        #         (manifest puts mid360_lidar before mid360_imu, so
+        #         the topic does land within the longer window).
         defer_probe = float(cfg.get("defer_probe_s", 2.0))
+        sentinel_timeout = float(cfg.get("sentinel_timeout_s", 30.0))
 
-        if not _wait_for_imu(imu_topic, defer_probe):
+        if _wait_for_imu(imu_topic, defer_probe):
+            pass  # phase 1 hit
+        elif _wait_for_imu(imu_topic, max(0.0, sentinel_timeout - defer_probe)):
+            log.info("topic landed in phase 2 (sentinel fallback)")
+        else:
+            # Once rbnx-cli grows defer-queue handling, swap state="error"
+            # for state="deferred" here so it retries us out-of-band.
             return lifecycle_pb2.Driver_Response(
-                ok=False, state="deferred",
-                error=f"waiting for {imu_topic} (mid360_lidar_rbnx not initialized yet?)",
+                ok=False, state="error",
+                error=f"no Imu on {imu_topic} within {sentinel_timeout:.1f}s "
+                      f"(is mid360_lidar_rbnx initialized?)",
             )
 
         try:
